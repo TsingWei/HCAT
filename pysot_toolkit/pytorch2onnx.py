@@ -15,6 +15,15 @@ from ltr.models.backbone.transt_backbone import build_backbone,Backbone
 from ltr.models.neck.featurefusion_network import build_featurefusion_network
 import ltr.admin.settings as ws_settings
 from ltr.models.neck.position_encoding import build_position_encoding
+from thop import profile
+from thop.utils import clever_format
+import copy
+import time
+import numpy as np
+import onnxruntime as ort
+from onnxconverter_common import float16
+import onnx
+from onnxsim import simplify as simplify_func
 os.environ["CUDA_VISIBLE_DEVICES"]= "0"
 
 def to_numpy(tensor):
@@ -112,19 +121,81 @@ if __name__ == "__main__":
         feature_template_d = 256
     else:
         feature_template_d = 96
-    use_gpu = True
+    use_gpu = False
     num_classes = 1
     model_path = os.path.join(os.path.dirname(__file__),'models','convnext_tiny_N2_q16.pth')
     backbone_net = build_backbone(settings,backbone_pretrained=False)
     featurefusion_network = build_featurefusion_network(settings)
     net = HCAT(backbone_net,featurefusion_network,num_classes=num_classes)
-    checkpoints = torch.load(model_path)['net']
-    net.load_state_dict(torch.load(model_path)['net'],strict=False)
+    # checkpoints = torch.load(model_path)['net']
+    # net.load_state_dict(torch.load(model_path)['net'],strict=False)
+    net.eval()
     if use_gpu:
         net.cuda()
-        net.eval()
+        device = 'cuda:0'
+    else:
+        device = 'cpu'
+
+    ### INPUT
+    search = torch.randn(1, 3, search_size, search_size).to(device)
+    # template = torch.randn(1, 3, template_size, template_size).cuda()
+    feature_template = torch.randn(1, feature_template_d, feature_size_template, feature_size_template).to(device)
+    pos_template = torch.randn(1, 256, feature_size_template, feature_size_template).to(device)
+
+    dtype = np.float32
+    inputs=(search, feature_template, pos_template)
+    inputs_onnx = {'x':  np.array(search.cpu(), dtype=dtype),
+                   'zf': np.array(feature_template.cpu(), dtype=dtype),
+                   'zp': np.array(pos_template.cpu(), dtype=dtype),
+                #    'tbb': np.array(template_bb.cpu(), dtype=dtype),
+                   }
+
+    model = net
+    model_ = copy.deepcopy(model)
+    macs1, params1 = profile(model, inputs=(search, feature_template, pos_template),
+                             custom_ops=None, verbose=False)
+    macs, params = clever_format([macs1, params1], "%.3f")
+    print('overall macs is ', macs)
+    print('overall params is ', params)
+
+    torch.onnx.export(model, 
+        inputs,
+        'test_net.onnx', 
+        input_names=[ "x", "zf", 'zp'], 
+        output_names=["output"],
+        opset_version=11,
+        export_params=True,
+        # verbose=True,
+        # dynamic_axes={'input':{0:'batch', 2:'h', 3:'w'}, 'output':{0:'batch', 2:'h2', 3:'w2'}} 
+    )
+
+    providers = ['CPUExecutionProvider']
+    ort_session = ort.InferenceSession("test_net.onnx", providers=providers)
+
+    T_w = 100
+    T_t = 500
+    print("testing speed ...")
+    torch.cuda.synchronize()
+    with torch.no_grad():
+        # overall
+        for i in range(T_w):
+            # _ = model_(search, feature_template, pos_template)
+            output = ort_session.run(output_names=['output'],
+                             	input_feed=inputs_onnx,
+                                )
+        start = time.time()
+        for i in range(T_t):
+            # _ = model_(search, feature_template, pos_template)
+            output = ort_session.run(output_names=['output'],
+                             	input_feed=inputs_onnx,
+                                )
+        torch.cuda.synchronize()
+        end = time.time()
+        avg_lat = (end - start) / T_t
+        print("The average overall latency is %.2f ms" % (avg_lat * 1000))
+        print("FPS is %.2f fps" % (1. / avg_lat))
     ######convert and check tracking pytorch model to onnx#####
-    convert_tracking_model(net,search_size,feature_size_template,feature_template_d)
+    # convert_tracking_model(net,search_size,feature_size_template,feature_template_d)
     ######convert and check template pytorch model to onnx#####
-    convert_template_model(net,template_size)
+    # convert_template_model(net,template_size)
 

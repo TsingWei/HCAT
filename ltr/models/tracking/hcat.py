@@ -5,9 +5,7 @@ from ltr import model_constructor
 import torch
 import torch.nn.functional as F
 from util import box_ops
-from util.misc import (NestedTensor, nested_tensor_from_tensor,
-                       nested_tensor_from_tensor_2,
-                       accuracy)
+from util.misc import (accuracy)
 
 from ltr.models.backbone.transt_backbone import build_backbone
 from ltr.models.loss.matcher import build_matcher
